@@ -327,6 +327,15 @@ function extend(from, to) {
     to.prototype.constructor = to;
 }
 
+function extendMore(from, to) {
+    for (var key in from) {
+        var value = from[key];
+        if (value == Object.prototype[key]) continue;
+
+        to.prototype[key] = value;
+    }
+}
+
 function toURLEncoded(prefix, obj) {
 	var prefixEqual = (prefix ? prefix + "=" : "");
 
@@ -508,6 +517,21 @@ function getCache(name, str) {
     }
 }
 
+function getMultipleCache(name, ___) {
+    if (!cacheSlots) return null;
+
+	var slot = cacheSlots[name];
+    if (slot) {
+        for (var i = 1, c = arguments.length; i < c; ++i) {
+            slot = slot[arguments[i]];
+            if (!slot) return null;
+        }
+        return slot;
+    } else {
+        return null;
+    }
+}
+
 function putCache(name, str, it) {
     if (!cacheSlots) {
         var slot = {};
@@ -525,6 +549,72 @@ function putCache(name, str, it) {
         slot[str] = it;
     }
 }
+
+function putMultipleCache(name, ___) {
+    if (!cacheSlots) {
+        cacheSlots = {};
+        setTimeout(function() { cacheSlot = null; }, CACHE_EXPIRATION_TIME);
+    }
+
+    var slot = cacheSlots[name];
+    if (!slot) {
+        cacheSlots[name] = slot = {};
+    }
+
+    var argLen = arguments.length;
+    for (var i = 1, c = argLen - 2; i < c; ++i) {
+        var nextSlot = slot[arguments[i]];
+        if (!nextSlot) {
+            slot[arguments[i]] = nextSlot = {};
+        }
+
+        slot = nextSlot;
+    }
+
+    slot[arguments[argLen - 2]] = arguments[argLen - 1];
+}
+
+//
+// Data type dependant classes (Multiple inheritance)
+//
+
+var ArrayCommon = {
+    dataType: 'array',
+
+    getItem: function (target, index) {
+        return target[index];
+    },
+    
+    getItemLambda: function (target, index) {
+        return target + '[' + index + ']';
+    },
+
+    toJSON: function(track) {
+        if (track) {
+            track.push(this.data);
+        }
+        else {
+            track = [this.data];
+        }
+        
+        var json = Iterable.prototype.toJSON.call(this, track);
+        track.pop();
+
+        return json;
+    }
+};
+
+var StringCommon = {
+    dataType: 'string',
+
+    getItem: function (target, index) {
+        return target.charAt(index);
+    },
+
+    getItemLambda: function (target, index) {
+        return target + '.charAt(' + index + ')';
+    }
+};
 
 //
 // Iterable
@@ -1641,331 +1731,44 @@ Iterable.prototype.zip = function(second, resultSelector, arg) {
 
 function RandomAccessIterable(data) {
 	this.data = data;
-    this.rev = false;
 }
 extend(Iterable, RandomAccessIterable);
 
-RandomAccessIterable.prototype.initRegion = function () {
-    var r = this.region;
-    if (!r) {
-        this.region = r = {
-            queries: null,
-            measured: false,
-            start: null,
-            end: null,
-            take: null,
-            takeArg: null
-        };
-    }
-
-    return r;
-};
-
-RandomAccessIterable.prototype.addRegionQuery = function (type, proc, arg) {
-    var r = this.initRegion();
-    var q = r.queries;
-
-    if (!q) {
-        r.queries = q = [];
-    }
-
-    q.push(type);
-    q.push(proc);
-    q.push(arg);
-
-    r.start = r.end = null;
-    r.measured = false;
-
-    return this;
-};
-
-RandomAccessIterable.prototype.clone = function () {
-    var result = new this.constructor(this.data);
-
-    var r = this.region;
-    if (r) {
-        var rr = result.region = {
-            measured: r.measured,
-            start: r.start,
-            end: r.end,
-            take: r.take,
-            takeArg: r.takeArg
-        };
-
-        var q = r.queries;
-        if (q) {
-            var qq = rr.queries = [];
-            for (var i = 0, c = q.length; i < c; ++i) {
-                qq.push(q[i]);
-            }
-        }
-    }
-    
-    result.rev = this.rev;
-
-    return result;
-};
-
-RandomAccessIterable.prototype.reverseRegion = function () {
-    var r = this.initRegion();
-
-    if (r) {
-        if (r.take) {
-            r.measured = false;
-        }
-        r.take = r.takeArg = null;
-    }
-
-    this.rev = !this.rev;
-    
-    return this;
-};
-
-RandomAccessIterable.prototype.measureRegion = function () {
-    var region = this.initRegion();
-
-    if (!region.measured) {
-        var data = this.data;
-        var start = region.start;
-        var end = region.end;
-
-        if (start == null) start = 0;
-        if (end === null) end = data.length;
-
-        region.take = region.takeArg = null;
-
-        var queries = region.queries;
-
-        if (!queries) {
-            region.start = start;
-            region.end = end;
-        } else {
-            var codes = [];
-
-            for (var i = 0, c = queries.length; i < c; i += 3) {
-                var type = queries[i];
-                var proc = queries[i + 1];
-                var arg = queries[i + 2];
-
-                if (type == 'skipLeft') {
-                    if (typeof proc == 'number') {
-                        start = Math.min(end, start + proc);
-                    } else if (typeof proc == 'string') {
-                        var splited = [];
-                        var hints = lambdaGetUseCount(proc, 3, splited);
-
-                        var vars = prepareVariables(hints,
-                            'v', this.lambdaGetItem('d', 's'),
-                            null, null,
-                            'a', 'q[' + (i + 2) + ']');
-
-                        codes.push('for(;s<e;++s){', vars.decl,
-                            'if(!(', lambdaJoin(splited, vars.v, 's', vars.a), ')){break;}}');
-                    } else {
-                        codes.push('for(;s<e&&q[', i + 1, '](', this.lambdaGetItem('d', 's'), ',s,q[', i + 2, ']);++s);');
-                    }
-                } else if (type == 'skipRight') {
-                    if (typeof proc == 'number') {
-                        end = Math.max(start, end - proc);
-                    } else if (typeof proc == 'string') {
-                        var splited = [];
-                        var hints = lambdaGetUseCount(proc, 3, splited);
-
-                        var i1, i2;
-                        
-                        if (hints[1] == 0) {
-                            i1 = ''; i2 = 'e-1';
-                        } else {
-                            i1 = 'var _i=e-1;'; i2 = '_i';
-                        }
-
-                        var vars = prepareVariables(hints,
-                            'v', this.lambdaGetItem('d', i2),
-                            null, null,
-                            'a', 'q[' + (i + 2) + ']');
-
-                        codes.push('for(;s<e;--e){', i1, vars.decl,
-                            'if(!(', lambdaJoin(splited, vars.v, i2, vars.a), ')){break;}}');
-                    } else {
-                        codes.push('for(;s<e;--e){var _i=e-1;',
-                            'if(!q[', i + 1, '](', this.lambdaGetItem('d', '_i'), ',_i,q[', i + 2, '])){break;}}');
-                    }
-                } else if (type == 'takeLeft') {
-                    if (typeof proc == 'number') {
-                        end = Math.min(end, start + proc);
-                    } else {
-                        if (i == c - 3 && !this.rev) {
-                            region.take = proc;
-                            region.takeArg = arg;
-                        } else if (typeof proc == 'string') {
-                            var splited = [];
-                            var hints = lambdaGetUseCount(proc, 3, splited);
-
-                            var vars = prepareVariables(hints,
-                                '_v', this.lambdaGetItem('d', 'e'),
-                                null, null,
-                                '_a', 'q[' + (i + 2) + ']');
-
-                            codes.push('for(var _e2=e,e=s;e<_e2;++e){', vars.decl,
-                                'if(!(', lambdaJoin(splited, vars._v, 'e', vars._a), ')){break;}}');
-                        } else {
-                            codes.push('for(var _e2=e,e=s;e<_e2;++e){',
-                                'if(!q[', i + 1, '](', this.lambdaGetItem('d', 'e'), ',e,q[', i + 2, '])){break;}}');
-                        }
-                    }
-                } else if (type == 'takeRight') {
-                    if (typeof proc == 'number') {
-                        start = Math.max(start, end - proc);
-                    } else {
-                        if (i == c - 3 && this.rev) {
-                            region.take = proc;
-                            region.takeArg = arg;
-                        } else if (typeof proc == 'string') {
-                            var splited = [];
-                            var hints = lambdaGetUseCount(proc, 3, splited);
-
-                            var i1, i2;
-                            
-                            if (hints[1] == 0) {
-                                i1 = ''; i2 = 's-1';
-                            } else {
-                                i1 = 'var _i=s-1;'; i2 = '_i';
-                            }
-
-                            var vars = prepareVariables(hints,
-                                '_v', this.lambdaGetItem('d', i2),
-                                null, null,
-                                '_a', 'q[' + (i + 2) + ']');
-
-                            codes.push('for(var _s2=s,s=e;s>_s2;--s){', i1, vars.decl,
-                                'if(!(', lambdaJoin(splited, vars._v, i2, vars._a), ')){break;}}');
-                        } else {
-                            codes.push('for(var _s2=s,s=e;s>_s2;--s){var _i=s-1;',
-                                'if(!q[', i + 1, '](', this.lambdaGetItem('d', '_i'), ',_i,q[', i + 2, '])){break;}}');
-                        }
-                    }
-                }
-            }
-
-            if (codes.length > 0) {
-                codes.push('r.start=s;r.end=e;');
-                var f = new Function(alias, 'd', 'r', 'q', 's', 'e', codes.join(''));
-                f(from, data, region, queries, start, end);
-            } else {
-                region.start = start;
-                region.end = end;
-            }
-        }
-
-        region.measured = true;
-    }
-
-    return region;
-};
-
 RandomAccessIterable.prototype.each = function(proc, _a) {
-    var region = this.measureRegion();
-    var s = region.start;
-    var e = region.end;
-    
-    if (s >= e) {
-        this.broken = false;
-        return this;
-    }
-    
-	var data = this.data;
-    var take = region.take;
-    var takeArg = region.takeArg;
     var p;
     
-    var typeProc = typeof proc;
-    var typeTake = typeof take;
-    
-    if (typeProc == 'function' && (!take || typeTake == 'function')) {
-        this.broken = false;
-        
-        var rev = this.rev;
-        for (var s = region.start, e = region.end; s < e; !rev ? ++s : --e) {
-            var key = (!rev ? s : e - 1);
-            var value = data[key];
-            
-            if (take && !take(value, key, takeArg)) {
-                break;
-            } else if (proc(value, key, _a) === false) {
-                this.broken = true;
-                break;
-            }
-        }
-    } else {
-	    if (typeProc == "function") {
-            p = proc;
-            proc = '_p($,$$,@)';
-	    }
-
-        if (take) {
-            if (typeTake == 'string') {
-                proc = '!(' + lambdaReplace(take, '$', '$$', '_tla') + ')?_b=false:' + proc;
-            } else {
-                proc = '!_tl($,$$,_tla)?_b=false:' + proc;
-            }
-        }
-
-        var dt = this.dataType + (this.rev ? '_reversed' : '');
-        var f = getCache("each_" + dt, proc);
-
-        if (!f) {
-            var splited = [];
-            var hints = lambdaGetUseCount(proc, 3, splited);
-            var defV, v;
-
-            var i1, i2;
-            if (!this.rev) {
-                i1 = ''; i2 = '_s';
-            } else {
-                if (hints[1] == 0) {
-                    i1 = ''; i2 = '_e-1';
-                } else {
-                    i1 = 'var _i=_e-1;'; i2 = '_i';
-                }
-            }
-
-            var srcIncrement;
-            if (!this.rev) {
-                srcIncrement = '++_s';
-            } else {
-                srcIncrement = '--_e';
-            }
-            
-            var vars = prepareVariables(hints,
-                '_v', this.lambdaGetItem('s', i2, '_l'));
-
-            f = new Function(alias, "s", "_l", "_s", "_e", "a", "_tl", "_tla", "_p",
-                ["var _b=true;for(;_s<_e;", srcIncrement, "){", i1, vars.decl,
-                "if((", lambdaJoin(splited, vars._v, i2, "a"), ")===false){return _b;}}return false;"].join(''));
-            putCache("each_" + dt, proc, f);
-        }
-
-        this.broken = f(from, data, data.length, region.start, region.end, _a, take, takeArg, p);
+    if (typeof proc == "function") {
+        p = proc;
+        proc = '_p($,$$,@)';
     }
+
+    var f = getCache("each." + this.dataType, proc);
+
+    if (!f) {
+        var splited = [];
+        var hints = lambdaGetUseCount(proc, 3, splited);
+
+        var vars = prepareVariables(hints,
+            '_v', this.getItemLambda('s', '_i'));
+
+        f = new Function(alias, "s", "a", "_p",
+            ["var _b=true;for(var _i=0,_l=s.length;_i<_l;++_i){", vars.decl,
+            "if((", lambdaJoin(splited, vars._v, '_i', "a"), ")===false){return _b;}}return false;"].join(''));
+        putCache("each." + this.dataType, proc, f);
+    }
+
+    this.broken = f(from, this.data, _a, p);
 
 	return this;
 };
 
 RandomAccessIterable.prototype.at = function(index) {
-    var r = this.measureRegion();
-    if (!this.rev) {
-	    return this.getItem(this.data, r.start + index);
-    } else {
-	    return this.getItem(this.data, r.end - index);
-    }
+    return this.getItem(this.data, index);
 };
 
 RandomAccessIterable.prototype.count = function(pred, arg) {
 	if (!pred) {
-        var r = this.measureRegion();
-        if (!r.take) {
-		    return r.end - r.start;
-        }
+        return this.data.length;
 	}
 
     return Iterable.prototype.count.call(this, pred, arg);
@@ -1973,10 +1776,7 @@ RandomAccessIterable.prototype.count = function(pred, arg) {
 
 RandomAccessIterable.prototype.any = function (pred, arg) {
     if (!pred) {
-        var r = this.measureRegion();
-        if (!r.take) {
-            return r.start < r.end;
-        }
+        return this.data.length > 0;
     }
 
     return Iterable.prototype.any.call(this, pred, arg);
@@ -1984,20 +1784,11 @@ RandomAccessIterable.prototype.any = function (pred, arg) {
 
 RandomAccessIterable.prototype.first = function(pred, arg) {
 	if (!pred) {
-        var r = this.measureRegion();
-        if (!r.take) {
-            var s = r.start;
-            var e = r.end;
-
-            if (s < e) {
-                if (!this.rev) {
-			        return this.getItem(this.data, s);
-                } else {
-                    return this.getItem(this.data, e - 1);
-                }
-            } else {
-                return;
-            }
+        var data = this.data;
+        if (data.length > 0) {
+            return this.getItem(data, 0);
+        } else {
+            return;
         }
 	}
 
@@ -2006,20 +1797,11 @@ RandomAccessIterable.prototype.first = function(pred, arg) {
 
 RandomAccessIterable.prototype.last = function(pred, arg) {
 	if (!pred) {
-        var r = this.measureRegion();
-        if (!r.take) {
-            var s = r.start;
-            var e = r.end;
-
-            if (s < e) {
-                if (!this.rev) {
-                    return this.getItem(this.data, e - 1);
-                } else {
-                    return this.getItem(this.data, s);
-                }
-            } else {
-                return;
-            }
+        var data = this.data;
+        if (data.length > 0) {
+            return this.getItem(data, data.length - 1);
+        } else {
+            return;
         }
 	}
     
@@ -2035,7 +1817,7 @@ RandomAccessIterable.prototype.orderByDesc = function(keySelector, comparer, arg
 };
 
 RandomAccessIterable.prototype.reverse = function () {
-    return this.clone().reverseRegion();
+    return new RandomAccessReversedIterable(this.data);
 };
 
 RandomAccessIterable.prototype.skip = function (count) {
@@ -2067,28 +1849,16 @@ RandomAccessIterable.prototype.takeWhile = function (pred, arg) {
 };
 
 RandomAccessIterable.prototype.toArray = function () {
-    var r = this.measureRegion();
-    if (!r.take) {
-        var get = this.getItem;
-        var data = this.data;
-        var s = r.start;
-        var e = r.end;
+    var get = this.getItem;
+    var data = this.data;
+    var length = data.length;
 
-        var result = new Array(e - s);
-        if (!this.rev) {
-            for (var i = s; i < e; ++i) {
-                result[i - s] = get(data, i);
-            }
-        } else {
-            for (var i = e; i > s; --i) {
-                result[e - i] = get(data, i - 1);
-            }
-        }
-
-        return result;
+    var result = new Array(data.length);
+    for (var i = 0; i < length; ++i) {
+        result[i] = get(data, i);
     }
 
-    return Iterable.prototype.toArray.call(this);
+    return result;
 };
 
 RandomAccessIterable.prototype.trim = function(left, right, arg) {
@@ -2151,7 +1921,7 @@ RandomAccessIterable.prototype.zip = function(second, resultSelector, arg) {
 			procStr = "@p(" + rs + ",@k++,@a0)";
 		}
 
-        var _p = ["@.s>=@.e?@.b=false:((@.i=", index, '),(@.v=', self.lambdaGetItem('@.d', '@.i'), '),'];
+        var _p = ["@.s>=@.e?@.b=false:((@.i=", index, '),(@.v=', self.getItemLambda('@.d', '@.i'), '),'];
 
         if (take) {
             if (typeof take == 'string') {
@@ -2172,6 +1942,300 @@ RandomAccessIterable.prototype.zip = function(second, resultSelector, arg) {
 	return new Iterable(iterator);
 };
 
+// 
+// RandomAccessReversedIterable
+//
+
+function RandomAccessReversedIterable(data) {
+    RandomAccessIterable.call(this, data);
+}
+extend(RandomAccessIterable, RandomAccessReversedIterable);
+
+RandomAccessReversedIterable.prototype.clone = function () {
+    return new this.constructor(this.data);
+};
+
+RandomAccessReversedIterable.prototype.each = function(proc, _a) {
+    var p;
+    
+    if (typeof proc == "function") {
+        p = proc;
+        proc = '_p($,$$,@)';
+    }
+
+    var f = getCache("each.reversed." + this.dataType, proc);
+
+    if (!f) {
+        proc = lambdaReplace(proc, '_v', '_k', 'a');
+
+        f = new Function(alias, "s", "a", "_p",
+            ["var _b=true;for(var _i=s.length;_i>0;--_i){var _k=_i-1;var _v=", this.getItemLambda('s', '_k'),
+            ";if((", proc, ")===false){return _b;}}return false;"].join(''));
+        putCache("each.reversed." + this.dataType, proc, f);
+    }
+
+    this.broken = f(from, this.data, _a, p);
+
+	return this;
+};
+
+RandomAccessReversedIterable.prototype.at = function(index) {
+    var data = this.data;
+    return this.getItem(data, data.length - index - 1);
+};
+
+RandomAccessReversedIterable.prototype.first = function(pred, arg) {
+	if (!pred) {
+        var data = this.data;
+        if (data.length > 0) {
+            return this.getItem(data, data.length - 1);
+        } else {
+            return;
+        }
+	}
+
+    return Iterable.prototype.first.call(this, pred, arg);
+};
+
+RandomAccessReversedIterable.prototype.last = function(pred, arg) {
+	if (!pred) {
+        var data = this.data;
+        if (data.length > 0) {
+            return this.getItem(data, 0);
+        } else {
+            return;
+        }
+	}
+    
+    return Iterable.prototype.last.call(this, pred, arg);
+};
+
+RandomAccessReversedIterable.prototype.reverse = function () {
+    return new RandomAccessIterable(this);
+};
+
+RandomAccessReversedIterable.prototype.toArray = function () {
+    var get = this.getItem;
+    var data = this.data;
+    var length = data.length;
+
+    var result = new Array(data.length);
+    for (var i = 0; i < length; ++i) {
+        result[i] = get(data, length - i - 1);
+    }
+
+    return result;
+};
+
+// 
+// RandomAccessPartialIterable
+//
+
+function RandomAccessPartialIterable(data, skipLeft, skipRight, takeLeft, takeRight) {
+    RandomAccessIterable.call(this, data);
+    
+    this.skipLeft = (skipLeft || []);
+    this.skipRight = (skipRight || []);
+    this.takeLeft = (takeLeft || []);
+    this.takeRight = (takeRight || []);
+}
+extend(RandomAccessIterable, RandomAccessPartialIterable);
+
+RandomAccessPartialIterable.prototype.executePartialQueries = function (leftToRight) {
+    var f = ['var _tmp;'];
+    var methods = [];
+    var procs = [];
+    var list;
+
+    var data = this.data;
+    var result = {s: 0, e: data.length};
+
+    list = this.skipLeft;
+    for (var i = 0, c = list.length; i < c; ++i) {
+        var q = list[i];
+        var qtype = typeof q;
+
+        if (qtype == 'number') {
+            f.push('_o.s+=', q, ';');
+        } else if (qtype == 'string') {
+            args.push(list[++i]);
+            f.push('while(_o.s<_o.e&&', lambdaReplace(q, '_d[_o.s]', '_o.s', '_a[' + (args.length - 1) + ']'), ')++_o.s;');
+        } else {
+            args.push(list[++i]);
+            procs.push(q);
+            f.push('while(_o.s<_o.e&&_p[', procs.length - 1, '](_d[_o.s],_o.s,_a[', args.length - 1, ']))++_o.s;');
+        }
+    }
+
+    list = this.skipRight;
+    for (var i = 0, c = list.length; i < c; ++i) {
+        var q = list[i];
+        var qtype = typeof q;
+
+        if (qtype == 'number') {
+            f.push('_o.e-=', q, ';');
+        } else if (qtype == 'string') {
+            args.push(list[++i]);
+            f.push('while(_o.s<_o.e&&', lambdaReplace(q, '_d[_o.e-1]', '_o.e-1', '_a[' + (args.length - 1) + ']'), ')--_o.e;');
+        } else {
+            args.push(list[++i]);
+            procs.push(q);
+            f.push('while(_o.s<_o.e&&_p[', procs.length - 1, '](_d[_o.e-1],_o.e-1,_a[', args.length - 1, ']))--_o.e;');
+        }
+    }
+
+    list = this.takeLeft;
+    for (var i = 0, c = list.length; i < c; ++i) {
+        var q = list[i];
+        var qtype = typeof q;
+
+        if (qtype == 'number') {
+            f.push('_o.e=Math.min(_o.e,_o.s+', q, ');');
+        } else if (qtype == 'string') {
+            if (leftToRight && i >= c - 2) {
+                result.take = q;
+                result.takeArg = list[i + 1];
+                break;
+            } else {
+                args.push(list[++i]);
+                f.push('_tmp=_o.e;_o.e=_o.s;while(_o.e<=_tmp&&', lambdaReplace(q, '_d[_o.e-1]', '_o.e-1', '_a[' + (args.length - 1) + ']'), ')++_o.e;');
+            }
+        } else {
+            if (leftToRight && i >= c - 2) {
+                result.take = q;
+                result.takeArg = list[i + 1];
+                break;
+            } else {
+                args.push(list[++i]);
+                procs.push(q);
+                f.push('_tmp=_o.e;_o.e=_o.s;while(_o.e<=_tmp&&_p[', procs.length - 1, '](_d[_o.e-1]', '_o.e-1', '_a[', args.length - 1, ']))++_o.e;');
+            }
+        }
+    }
+
+    list = this.takeRight;
+    for (var i = 0, c = list.length; i < c; ++i) {
+        var q = list[i];
+        var qtype = typeof q;
+
+        if (qtype == 'number') {
+            f.push('_o.s=Math.max(_o.s,_o.e-', q, ');');
+        } else if (qtype == 'string') {
+            if (!leftToRight && i >= c - 2) {
+                result.take = q;
+                result.takeArg = list[i + 1];
+                break;
+            } else {
+                args.push(list[++i]);
+                f.push('_tmp=_o.s;_o.s=_o.e;while(_o.s>_tmp&&', lambdaReplace(q, '_d[_o.s-1]', '_o.s-1', '_a[' + (args.length - 1) + ']'), ')--_o.s;');
+            }
+        } else {
+            if (!leftToRight && i >= c - 2) {
+                result.take = q;
+                result.takeArg = list[i + 1];
+                break;
+            } else {
+                args.push(list[++i]);
+                procs.push(q);
+                f.push('_tmp=_o.s;_o.s=_o.e;while(_o.s>_tmp&&_p[', procs.length - 1, '](_d[_o.s-1]', '_o.s-1', '_a[', args.length - 1, ']))--_o.s;');
+            }
+        }
+    }
+
+    f = new Function('_d', '_o', '_p', '_a', f.join(''));
+    f(data, result, procs, args);
+
+    return result;
+};
+
+RandomAccessPartialIterable.prototype.each = function(proc, _a) {
+    var part = this.executePartialQueries(true);
+    var take = part.take;
+
+    var p;
+    
+    if (typeof proc == "function") {
+        p = proc;
+        proc = '_p($,$$,@)';
+    }
+
+    if (take) {
+        var f = getCache("each.partial.withTake." + this.dataType, proc);
+
+        if (!f) {
+            proc = lambdaReplace(proc, '_v', '_k', 'a');
+
+            f = new Function(alias, "s", "a", "_p",
+                ["var _b=true;for(var _i=s.length;_i>0;--_i){var _k=_i-1;var _v=", this.getItemLambda('s', '_k'),
+                ";if(", take, "(", proc, ")===false){return _b;}}return false;"].join(''));
+            putCache("each.partial." + this.dataType, proc, f);
+        }
+    } else {
+        var f = getCache("each.partial." + this.dataType, proc);
+
+        if (!f) {
+            proc = lambdaReplace(proc, '_v', '_k', 'a');
+
+            f = new Function(alias, "s", "a", "_p",
+                ["var _b=true;for(var _i=s.length;_i>0;--_i){var _k=_i-1;var _v=", this.getItemLambda('s', '_k'),
+                ";if((", proc, ")===false){return _b;}}return false;"].join(''));
+            putCache("each.partial." + this.dataType, proc, f);
+        }
+    }
+
+    this.broken = f(from, this.data, _a, p);
+
+	return this;
+};
+
+RandomAccessReversedIterable.prototype.at = function(index) {
+    var data = this.data;
+    return this.getItem(data, data.length - index - 1);
+};
+
+RandomAccessReversedIterable.prototype.first = function(pred, arg) {
+	if (!pred) {
+        var data = this.data;
+        if (data.length > 0) {
+            return this.getItem(data, data.length - 1);
+        } else {
+            return;
+        }
+	}
+
+    return Iterable.prototype.first.call(this, pred, arg);
+};
+
+RandomAccessReversedIterable.prototype.last = function(pred, arg) {
+	if (!pred) {
+        var data = this.data;
+        if (data.length > 0) {
+            return this.getItem(data, 0);
+        } else {
+            return;
+        }
+	}
+    
+    return Iterable.prototype.last.call(this, pred, arg);
+};
+
+RandomAccessReversedIterable.prototype.reverse = function () {
+    return new RandomAccessIterable(this);
+};
+
+RandomAccessReversedIterable.prototype.toArray = function () {
+    var get = this.getItem;
+    var data = this.data;
+    var length = data.length;
+
+    var result = new Array(data.length);
+    for (var i = 0; i < length; ++i) {
+        result[i] = get(data, length - i - 1);
+    }
+
+    return result;
+};
+
 //
 // StringIterable
 //
@@ -2183,7 +2247,7 @@ extend(RandomAccessIterable, StringIterable);
 
 StringIterable.prototype.dataType = 'string';
 
-StringIterable.prototype.lambdaGetItem = function (target, index) {
+StringIterable.prototype.getItemLambda = function (target, index) {
     return target + '.charAt(' + index + ')';
 };
 
@@ -2223,52 +2287,41 @@ function ArrayIterable(array) {
     RandomAccessIterable.call(this, array);
 }
 extend(RandomAccessIterable, ArrayIterable);
+extendMore(ArrayCommon, ArrayIterable);
 
-ArrayIterable.prototype.dataType = 'array';
-
-ArrayIterable.prototype.lambdaGetItem = function (target, index) {
-    return target + '[' + index + ']';
-};
-
-ArrayIterable.prototype.getItem = function (target, index) {
-    return target[index];
-};
-
-ArrayIterable.prototype.toJSON = function(track) {
-	if (track) {
-		track.push(this.data);
-	}
-	else {
-		track = [this.data];
-	}
-	
-	var json = Iterable.prototype.toJSON.call(this, track);
-	track.pop();
-
-	return json;
+ArrayIterable.prototype.reverse = function () {
+    return new ArrayReversedIterable(this.data);
 };
 
 ArrayIterable.prototype.toArray = function () {
-    if (this.mutable) {
-        if (this.rev) {
-        } else {
-            var r = this.measureRegion();
-            if (!r.take) {
-                return this.data.slice(r.start, r.end);
-            }
-        }
-    } else {
-        if (this.rev) {
-            return RandomAccessIterable.prototype.toArray.call(this);
-        }
-        
-        var r = this.measureRegion();
-        if (!r.take) {
-            return this.data.slice(r.start, r.end);
-        }
-    }
+    var data = this.data;
+    return data.slice(0, data.length);
+};
 
-    return Iterable.prototype.toArray.call(this);
+//
+// ArrayReversedIterable
+//
+
+function ArrayReversedIterable(array) {
+    RandomAccessReversedIterable.call(this, array);
+}
+extend(RandomAccessReversedIterable, ArrayReversedIterable);
+extendMore(ArrayCommon, ArrayReversedIterable);
+
+ArrayReversedIterable.prototype.reverse = function () {
+    return new ArrayIterable(this.data);
+};
+
+ArrayReversedIterable.prototype.toArray = function () {
+    var data = this.data;
+    var length = data.length;
+    var array = new Array(length);
+    var getItem = this.getItem;
+
+    for (var i = 0; i < length; ++i) {
+        array[i] = getItem(data, length - i - 1);
+    }
+    return array;
 };
 
 //
@@ -2664,8 +2717,8 @@ OrderedRandomAccessIterable.prototype.each = function(proc, arg) {
                 }
 
                 switch (uses[0]) {
-                case 0: case 1: defV = ""; v = it.lambdaGetItem('r', k); break;
-                default: defV = "var v=" + it.lambdaGetItem('r', k) + ";"; v = "v"; break;
+                case 0: case 1: defV = ""; v = it.getItemLambda('r', k); break;
+                default: defV = "var v=" + it.getItemLambda('r', k) + ";"; v = "v"; break;
                 }
 
                 f = new Function(alias, "l", "r", "a",
